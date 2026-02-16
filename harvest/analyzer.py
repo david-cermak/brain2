@@ -33,13 +33,14 @@ SYSTEM_PROMPT = """\
 You are an expert embedded-systems engineer specialising in ESP-IDF, \
 esp-modem, PPP networking, and cellular modem integration.
 
+You are building a knowledge base to help TRIAGE FUTURE esp-modem issues. \
 Analyse the following GitHub issue thread and return a single JSON object \
 with exactly these keys:
 
 {
-  "relevant": <bool — true if the issue is actually about esp-modem, PPP, \
-modem AT commands, CMUX, DTE/DCE, or cellular connectivity on ESP32; \
-false if it is unrelated>,
+  "relevance": <int 0-100 — how useful this issue's learnings would be for \
+triaging a FUTURE similar issue. See scoring guide below>,
+  "relevance_reason": "<one sentence explaining the score>",
   "summary": "<one paragraph describing the problem>",
   "root_cause": "<what went wrong — null if unknown>",
   "solution": "<how it was resolved — null if unresolved or unknown>",
@@ -47,31 +48,63 @@ false if it is unrelated>,
   "tags": ["<topic tag>", "..."]
 }
 
+Relevance scoring guide (0-100):
+  90-100: Issue reveals a non-obvious esp-modem/PPP/CMUX runtime bug, \
+    modem-specific quirk, or protocol-level insight with a clear root cause \
+    and fix that would directly help diagnose a similar future issue. \
+    Example: CMUX frame type incompatibility with specific modem, DTR line \
+    causing unexpected mode exit, DTE callback restoration bug.
+  60-89: Issue is about esp-modem behavior with useful lessons, but the \
+    root cause or solution is only partially clear, or the insight is \
+    somewhat specific to one user's setup.
+  30-59: Issue mentions esp-modem but the lessons are generic, the info is \
+    inconclusive, or it has limited future triage value. Examples: user \
+    integration mistakes, vague "it doesn't work" without clear resolution.
+  0-29: NOT useful for future triage. Score low for ANY of these reasons:
+    - General programming knowledge (e.g. virtual destructors, error handling)
+    - Build / compile / linker / CMake / component-manager issues
+    - Application bugs unrelated to modem library code
+    - Already fixed trivially in the modem layer with no reoccurrence risk
+    - Stack overflow or generic RTOS issues not specific to modem
+    - Not enough information to draw actionable conclusions
+    - Documentation or API signature mismatch issues
+    - Feature requests or "how to" questions without technical depth
+
 Rules:
 - Return ONLY valid JSON, no markdown fences, no commentary.
 - "tags" should be short lowercase labels like "ppp", "cmux", "usb modem", \
 "carrier loss", "at commands", "dce/dte", "netif", "ota", "memory leak", etc.
-- "lessons" should be concrete and useful for a developer building with esp-modem.
-- If the issue is not relevant, still fill summary but set root_cause, \
-solution, and lessons to null/empty.
+- "lessons" should be concrete and specific to esp-modem — NOT generic \
+programming advice. If you can't write a lesson that's specific to modem/PPP \
+behavior, that's a sign the relevance score should be lower.
+- If relevance < 30, set lessons to an empty list [].
 """
 
 
 # ── Database ──────────────────────────────────────────────────
 
 def init_analysis_table(conn: sqlite3.Connection) -> None:
-    """Create the analysis table if it doesn't exist."""
+    """Create or migrate the analysis table."""
+    # Check if we need to migrate from the old schema (relevant BOOLEAN → relevance INTEGER)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(analysis)").fetchall()}
+    if "relevant" in cols and "relevance" not in cols:
+        print("Migrating analysis table: relevant → relevance ...", file=sys.stderr, flush=True)
+        conn.execute("DROP TABLE analysis")
+        conn.execute("UPDATE issues SET processed_at = NULL")
+        conn.commit()
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS analysis (
-            repo            TEXT    NOT NULL,
-            issue_number    INTEGER NOT NULL,
-            relevant        BOOLEAN,
-            summary         TEXT,
-            root_cause      TEXT,
-            solution        TEXT,
-            lessons_json    TEXT,
-            tags_json       TEXT,
-            analyzed_at     TEXT,
+            repo              TEXT    NOT NULL,
+            issue_number      INTEGER NOT NULL,
+            relevance         INTEGER,
+            relevance_reason  TEXT,
+            summary           TEXT,
+            root_cause        TEXT,
+            solution          TEXT,
+            lessons_json      TEXT,
+            tags_json         TEXT,
+            analyzed_at       TEXT,
             PRIMARY KEY (repo, issue_number)
         )
     """)
@@ -107,13 +140,14 @@ def save_analysis(conn: sqlite3.Connection, repo: str, issue_number: int,
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("""
         INSERT OR REPLACE INTO analysis
-            (repo, issue_number, relevant, summary, root_cause, solution,
-             lessons_json, tags_json, analyzed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (repo, issue_number, relevance, relevance_reason, summary,
+             root_cause, solution, lessons_json, tags_json, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         repo,
         issue_number,
-        result.get("relevant", False),
+        result.get("relevance", 0),
+        result.get("relevance_reason"),
         result.get("summary"),
         result.get("root_cause"),
         result.get("solution"),
@@ -186,11 +220,15 @@ def write_markdown(issue: dict, result: dict) -> Path:
     lessons = result.get("lessons") or []
     tags = result.get("tags") or []
 
+    relevance = result.get("relevance", 0)
+    relevance_reason = result.get("relevance_reason", "")
+
     lines = [
         f"# {issue['title']}",
         "",
         f"**Issue:** [{issue['repo']}#{issue['issue_number']}]({issue['html_url']})  ",
-        f"**State:** {issue['state']}  |  **Labels:** {issue['labels'] or 'none'}",
+        f"**State:** {issue['state']}  |  **Labels:** {issue['labels'] or 'none'}  ",
+        f"**Relevance:** {relevance}% — {relevance_reason}",
         "",
         "## Summary",
         "",
@@ -232,6 +270,8 @@ def main() -> int:
                         help="Max number of issues to process (default: all)")
     parser.add_argument("--repo", type=str, default=None,
                         help="Filter by repo substring, e.g. 'esp-protocols' or 'esp-idf'")
+    parser.add_argument("--min-relevance", type=int, default=60,
+                        help="Min relevance score to write markdown (default: 60)")
     parser.add_argument("--db", type=str, default=DB_PATH,
                         help="Path to harvest.db")
     args = parser.parse_args()
@@ -253,7 +293,7 @@ def main() -> int:
     repo_msg = f" (repo filter: {args.repo})" if args.repo else ""
     print(f"Found {total} unprocessed issue(s) to analyse{repo_msg}.", file=sys.stderr, flush=True)
 
-    stats = {"processed": 0, "relevant": 0, "skipped_error": 0}
+    stats = {"processed": 0, "kept": 0, "low_relevance": 0, "skipped_error": 0}
 
     for i, issue in enumerate(issues, 1):
         repo = issue["repo"]
@@ -274,9 +314,12 @@ def main() -> int:
             stats["skipped_error"] += 1
             continue
 
-        relevant = result.get("relevant", False)
+        relevance = result.get("relevance", 0)
+        reason = result.get("relevance_reason", "")
         tags = result.get("tags") or []
-        print(f"  relevant={relevant}  tags={tags}", file=sys.stderr, flush=True)
+        print(f"  relevance={relevance}%  tags={tags}", file=sys.stderr, flush=True)
+        if reason:
+            print(f"  reason: {reason}", file=sys.stderr, flush=True)
 
         try:
             save_analysis(conn, repo, num, result)
@@ -285,10 +328,12 @@ def main() -> int:
             stats["skipped_error"] += 1
             continue
 
-        if relevant:
+        if relevance >= args.min_relevance:
             md_path = write_markdown(issue, result)
             print(f"  → {md_path}", file=sys.stderr, flush=True)
-            stats["relevant"] += 1
+            stats["kept"] += 1
+        else:
+            stats["low_relevance"] += 1
 
         stats["processed"] += 1
 
@@ -296,14 +341,21 @@ def main() -> int:
     print(f"\n{'='*60}", file=sys.stderr, flush=True)
     print(
         f"Done: processed {stats['processed']}, "
-        f"relevant {stats['relevant']}, "
+        f"kept {stats['kept']} (>={args.min_relevance}%), "
+        f"low relevance {stats['low_relevance']}, "
         f"errors {stats['skipped_error']}",
         file=sys.stderr, flush=True,
     )
 
     total_analysed = conn.execute("SELECT COUNT(*) FROM analysis").fetchone()[0]
-    total_relevant = conn.execute("SELECT COUNT(*) FROM analysis WHERE relevant = 1").fetchone()[0]
-    print(f"Total in analysis table: {total_analysed} ({total_relevant} relevant)", file=sys.stderr, flush=True)
+    total_kept = conn.execute(
+        "SELECT COUNT(*) FROM analysis WHERE relevance >= ?",
+        (args.min_relevance,),
+    ).fetchone()[0]
+    print(
+        f"Total in analysis table: {total_analysed} ({total_kept} with relevance >= {args.min_relevance}%)",
+        file=sys.stderr, flush=True,
+    )
 
     conn.close()
     return 0
