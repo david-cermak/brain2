@@ -6,12 +6,13 @@ and cellular modem integration on ESP32.
 ## Pipeline Overview
 
 ```
-[1. harvester.py]  →  [2. analyzer.py]  →  [3. indexer (future)]
- GitHub API            OpenAI LLM           Supabase pgvector
- ↓                     ↓                    ↓
- harvest.db            harvest.db           vector search
- (issues table)        (analysis table)
-                       knowledge/issues/*.md
+[1. harvester.py]  →  [2. analyzer.py]  →  [2.5 graph_builder.py]  →  [3. indexer (future)]
+ GitHub API            OpenAI LLM           Merge & build KG          Supabase pgvector
+ ↓                     ↓                    ↓                         ↓
+ harvest.db            harvest.db           harvest.db                vector search
+ (issues table)        (analysis table)     (kg_entities/relations)
+                       (kg_raw_* tables)    knowledge/knowledge_graph.json
+                       knowledge/issues/*   knowledge/knowledge_graph.graphml
 ```
 
 ## Setup
@@ -127,6 +128,59 @@ knowledge/issues/
 
 Each file contains: summary, root cause, solution, lessons learned, and tags.
 
+## Stage 2.5: Knowledge Graph (`graph_builder.py`)
+
+Reads per-issue entity/relation extractions from `kg_raw_entities` and
+`kg_raw_relations` tables, merges entities by normalized name, aggregates
+relations, and produces a unified knowledge graph.
+
+**How entities are extracted:**
+- **New issues** (via `analyzer.py`): The LLM prompt now includes KG extraction
+  alongside the existing analysis — entities and relations come back in the same
+  JSON response at zero additional LLM cost.
+- **Already-analyzed issues** (via `analyzer.py --extract-kg`): A lightweight
+  KG-only prompt is sent using the condensed analysis text (summary, root cause,
+  solution, lessons) — much cheaper than re-analyzing the full issue thread.
+
+**Entity types:** `modem_model`, `component`, `error_pattern`, `config_option`,
+`symptom`, `root_cause_cat`, `solution_pattern`, `idf_version`
+
+**Relation types:** `EXHIBITS`, `CAUSED_BY`, `FIXED_BY`, `INVOLVES_CONFIG`,
+`ORIGINATES_FROM`, `AFFECTS_COMPONENT`, `HAS_QUIRK`, `VERSION_SPECIFIC`
+
+```bash
+# Extract KG from already-analyzed issues (lightweight KG-only LLM call)
+python analyzer.py --extract-kg
+
+# Extract KG for specific repo only, limit to 10 issues
+python analyzer.py --extract-kg --repo esp-protocols --limit 10
+
+# Build the merged knowledge graph
+python graph_builder.py
+```
+
+**Output:**
+- Merged `kg_entities` and `kg_relations` tables in `harvest.db`
+- `knowledge/knowledge_graph.json` — full graph with stats
+- `knowledge/knowledge_graph.graphml` — for visualization (yEd, Gephi, etc.)
+
+**Database tables:**
+
+| Table | Description |
+|-------|-------------|
+| `kg_raw_entities` | Per-issue entity extractions (raw LLM output) |
+| `kg_raw_relations` | Per-issue relation extractions (raw LLM output) |
+| `kg_entities` | Merged entities (built by `graph_builder.py`) |
+| `kg_relations` | Merged relations (built by `graph_builder.py`) |
+
+**Example graph traversal:**
+```
+[modem_model] BG96
+  --EXHIBITS--> [symptom] cmux setup failure
+    --CAUSED_BY--> [root_cause_cat] strict UIH type assumption
+      --FIXED_BY--> [solution_pattern] tolerant UIH parsing
+```
+
 ## Stage 3: Index (future)
 
 Will embed the summaries + lessons into Supabase pgvector for RAG-style
@@ -138,3 +192,6 @@ semantic search. See `../knowledge/search.py` for the existing prototype.
   If a new comment is added to an old issue, it gets re-fetched.
 - **Analyzer:** Only processes issues where `processed_at IS NULL`. To re-analyze
   an issue, set its `processed_at` back to NULL in the DB.
+- **KG extraction:** `--extract-kg` only processes analyzed issues that don't
+  have KG data yet. To re-extract, delete rows from `kg_raw_entities` for that issue.
+- **Graph builder:** Safe to re-run. Drops and rebuilds the merged tables each time.
