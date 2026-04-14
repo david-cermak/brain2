@@ -16,7 +16,7 @@ for issue in myIssues:
        count = count + 1
 print(count)
 
-issue = repo.get_issue(number=992)
+issue = repo.get_issue(number=1019)
 print(f"# {issue.title}\n")
 print(f"@{issue.user.login}:")
 print(issue.body or "")
